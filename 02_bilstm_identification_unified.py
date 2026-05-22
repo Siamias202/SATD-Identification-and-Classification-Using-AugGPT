@@ -2,400 +2,636 @@
 =============================================================
 SATD Replication  |  Script 2 of 3  —  BiLSTM Identification
 =============================================================
-Paper : Deep Learning and Data Augmentation for Detecting
-        Self-Admitted Technical Debt (arXiv:2410.15804)
 
-Input : binary_train/val/test.csv  from 01_preprocessing.py
-        (single merged dataset — no artifact separation)
+CodeBERT Version
+----------------
+Replaces GloVe embeddings with frozen CodeBERT embeddings.
 
-Output: bilstm_best.pt    (saved model weights)
+Pipeline:
+    Text
+    → CodeBERT [CLS] embedding (768-d)
+    → BiLSTM stack
+    → Binary SATD classification
 
-Labels (binary):
-    0 = non_debt
-    1 = SATD  (code_debt | design_debt | documentation_debt
-               | test_debt | requirement_debt)
+Input:
+    binary_train.csv
+    binary_val.csv
+    binary_test.csv
 
-Architecture (Section III-F):
-    Embedding(GloVe-300d)
-    → BiLSTM(128) + Dropout(0.3) + BatchNorm
-    → BiLSTM(64)  + Dropout(0.3)
-    → BiLSTM(128) + Dropout(0.3)
-    → BiLSTM(128) [last hidden state]
-    → Linear(256 → 2)
+Output:
+    bilstm_best.pt
+    <log_name>.txt
 
-GloVe variants:
-    glove.6B.50d.txt   —  50d,  69 MB
-    glove.6B.100d.txt  — 100d, 171 MB
-    glove.6B.200d.txt  — 200d, 342 MB
-    glove.6B.300d.txt  — 300d, 462 MB  ← recommended
-    glove.42B.300d.txt — 300d, 1.75 GB
-    glove.840B.300d.txt— 300d, 2.03 GB
-
-Download:
-    wget https://nlp.stanford.edu/data/glove.6B.zip
-    unzip glove.6B.zip
+Install:
+    pip install torch transformers pandas scikit-learn
 
 Usage:
-    pip install torch numpy pandas scikit-learn
-
-    # Recommended (300d)
     python 02_bilstm_identification.py \
         --processed_dir ./processed \
-        --glove_path ./glove.6B.300d.txt
+        --log_name codebert_run
 
-    # Different variant — pass matching embed_dim
-    python 02_bilstm_identification.py \
-        --processed_dir ./processed \
-        --glove_path ./glove.6B.200d.txt \
-        --embed_dim 200
-
-    # No GloVe (random init)
-    python 02_bilstm_identification.py \
-        --processed_dir ./processed
 =============================================================
 """
 
 import argparse
 import os
-import numpy as np
-import pandas as pd
-from collections import defaultdict
+from contextlib import redirect_stdout
 
+import pandas as pd
 import torch
 import torch.nn as nn
+
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import f1_score, classification_report
+from transformers import AutoTokenizer, AutoModel
+
+from sklearn.metrics import (
+    classification_report,
+    f1_score
+)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  Vocabulary
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 1. CodeBERT Embedder
+# ─────────────────────────────────────────────────────────────
 
-class Vocabulary:
-    PAD = "<PAD>"
-    UNK = "<UNK>"
-
-    def __init__(self):
-        self.word2idx = {self.PAD: 0, self.UNK: 1}
-
-    def build(self, texts: list, min_freq: int = 1, max_vocab: int = 50_000):
-        freq = defaultdict(int)
-        for text in texts:
-            for tok in str(text).split():
-                freq[tok] += 1
-        for word, cnt in sorted(freq.items(), key=lambda x: -x[1]):
-            if cnt >= min_freq and len(self.word2idx) < max_vocab:
-                self.word2idx[word] = len(self.word2idx)
-        print(f"  Vocabulary size : {len(self.word2idx):,}")
-
-    def encode(self, text: str, max_len: int) -> list:
-        tokens = str(text).split()[:max_len]
-        ids    = [self.word2idx.get(t, 1) for t in tokens]
-        ids   += [0] * (max_len - len(ids))
-        return ids
-
-    def __len__(self):
-        return len(self.word2idx)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  GloVe loader
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_glove(path: str, vocab: Vocabulary, dim: int) -> np.ndarray:
+class CodeBERTEmbedder:
     """
-    Build embedding matrix (vocab_size, dim).
-    Words missing from GloVe keep zero vectors. PAD stays zero.
-    dim must match the file suffix: 50 | 100 | 200 | 300
+    Produces one 768-d vector per text using
+    frozen CodeBERT CLS token embeddings.
     """
-    matrix = np.zeros((len(vocab), dim), dtype=np.float32)
 
-    if not path or not os.path.exists(path):
-        print("  ⚠  GloVe file not found — using random init (lower performance)")
-        rng    = np.random.default_rng(42)
-        matrix = rng.normal(0, 0.1, (len(vocab), dim)).astype(np.float32)
-        matrix[0] = 0.0
-        return matrix
+    def __init__(self, device):
 
-    found = 0
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.rstrip().split(" ")
-            word  = parts[0]
-            if word in vocab.word2idx:
-                matrix[vocab.word2idx[word]] = np.array(parts[1:], dtype=np.float32)
-                found += 1
+        self.device = device
 
-    print(f"  GloVe : {found:,} / {len(vocab):,} words matched  (dim={dim})")
-    return matrix
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "microsoft/codebert-base"
+        )
+
+        self.model = AutoModel.from_pretrained(
+            "microsoft/codebert-base"
+        ).to(device)
+
+        self.model.eval()
+
+    @torch.no_grad()
+    def embed_batch(self,
+                    texts: list,
+                    batch_size: int = 64):
+
+        all_vecs = []
+
+        for i in range(0, len(texts), batch_size):
+
+            batch = texts[i:i + batch_size]
+
+            enc = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=128,
+                return_tensors="pt"
+            ).to(self.device)
+
+            out = self.model(**enc)
+
+            # CLS token embedding
+            vecs = out.last_hidden_state[:, 0, :].cpu()
+
+            all_vecs.append(vecs)
+
+        return torch.cat(all_vecs, dim=0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  Dataset
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 2. Dataset
+# ─────────────────────────────────────────────────────────────
 
-class BinaryDataset(Dataset):
-    """
-    Reads binary_train/val/test.csv
-    Required columns: text_clean, binary_label
-    """
-    def __init__(self, df: pd.DataFrame, vocab: Vocabulary, max_len: int):
-        self.x = [vocab.encode(t, max_len) for t in df["text_clean"].astype(str)]
-        self.y = df["binary_label"].astype(int).tolist()
+class EmbeddingDataset(Dataset):
+
+    def __init__(self,
+                 embeddings,
+                 labels):
+
+        self.x = embeddings.float()
+        self.y = torch.tensor(labels, dtype=torch.long)
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
+
         return (
-            torch.tensor(self.x[idx], dtype=torch.long),
-            torch.tensor(self.y[idx], dtype=torch.long),
+            self.x[idx],
+            self.y[idx]
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  BiLSTM Model  (Section III-F)
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 3. BiLSTM Model
+# ─────────────────────────────────────────────────────────────
 
 class BiLSTMClassifier(nn.Module):
-    """
-    Stacked BiLSTM for binary classification (non_debt vs SATD).
 
-        Embedding  (vocab_size, embed_dim)
-        BiLSTM-1   hidden=128 → out=256  Dropout(0.3)  BatchNorm1d(256)
-        BiLSTM-2   hidden= 64 → out=128  Dropout(0.3)
-        BiLSTM-3   hidden=128 → out=256  Dropout(0.3)
-        BiLSTM-4   hidden=128 → out=256  [last time-step only]
-        Linear(256 → num_classes)
-    """
+    def __init__(self,
+                 input_dim=768,
+                 num_classes=2,
+                 dropout=0.3):
 
-    def __init__(self, vocab_size: int, embed_dim: int,
-                 embed_matrix: np.ndarray,
-                 num_classes: int = 2, dropout: float = 0.3):
         super().__init__()
 
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.embedding.weight = nn.Parameter(
-            torch.tensor(embed_matrix, dtype=torch.float32)
+        # reshape input for LSTM
+        self.lstm1 = nn.LSTM(
+            input_dim,
+            128,
+            batch_first=True,
+            bidirectional=True
         )
 
-        self.lstm1 = nn.LSTM(embed_dim, 128, batch_first=True, bidirectional=True)
         self.drop1 = nn.Dropout(dropout)
         self.norm1 = nn.BatchNorm1d(256)
 
-        self.lstm2 = nn.LSTM(256, 64,  batch_first=True, bidirectional=True)
+        self.lstm2 = nn.LSTM(
+            256,
+            64,
+            batch_first=True,
+            bidirectional=True
+        )
+
         self.drop2 = nn.Dropout(dropout)
 
-        self.lstm3 = nn.LSTM(128, 128, batch_first=True, bidirectional=True)
+        self.lstm3 = nn.LSTM(
+            128,
+            128,
+            batch_first=True,
+            bidirectional=True
+        )
+
         self.drop3 = nn.Dropout(dropout)
 
-        self.lstm4 = nn.LSTM(256, 128, batch_first=True, bidirectional=True)
+        self.lstm4 = nn.LSTM(
+            256,
+            128,
+            batch_first=True,
+            bidirectional=True
+        )
 
         self.fc = nn.Linear(256, num_classes)
 
     def forward(self, x):
-        e = self.embedding(x)                       # (B, T, E)
 
-        o1, _ = self.lstm1(e)                       # (B, T, 256)
-        o1     = self.drop1(o1)
+        # x shape:
+        # (B, 768)
+
+        # reshape to sequence length 1
+        x = x.unsqueeze(1)
+
+        o1, _ = self.lstm1(x)
+
+        o1 = self.drop1(o1)
+
         B, T, H = o1.shape
-        o1     = self.norm1(o1.reshape(B * T, H)).reshape(B, T, H)
 
-        o2, _ = self.lstm2(o1)                      # (B, T, 128)
-        o2     = self.drop2(o2)
+        o1 = self.norm1(
+            o1.reshape(B * T, H)
+        ).reshape(B, T, H)
 
-        o3, _ = self.lstm3(o2)                      # (B, T, 256)
-        o3     = self.drop3(o3)
+        o2, _ = self.lstm2(o1)
+        o2 = self.drop2(o2)
 
-        o4, _ = self.lstm4(o3)                      # (B, T, 256)
-        last   = o4[:, -1, :]                       # (B, 256)
+        o3, _ = self.lstm3(o2)
+        o3 = self.drop3(o3)
 
-        return self.fc(last)                        # (B, 2)
+        o4, _ = self.lstm4(o3)
+
+        last = o4[:, -1, :]
+
+        return self.fc(last)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.  Training
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 4. Training
+# ─────────────────────────────────────────────────────────────
 
-def run_training(model, train_loader, val_loader, device,
-                 lr, max_epochs, patience, save_path):
+def run_training(model,
+                 train_loader,
+                 val_loader,
+                 device,
+                 lr,
+                 max_epochs,
+                 patience,
+                 save_path):
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    best_val_loss  = float("inf")
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr
+    )
+
+    best_val_loss = float("inf")
     patience_count = 0
 
     for epoch in range(1, max_epochs + 1):
 
-        # train
+        # ───── TRAIN ─────
+
         model.train()
+
         train_loss = 0.0
+
         for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
+
+            xb = xb.to(device)
+            yb = yb.to(device)
+
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+
+            out = model(xb)
+
+            loss = criterion(out, yb)
+
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            nn.utils.clip_grad_norm_(
+                model.parameters(),
+                1.0
+            )
+
             optimizer.step()
+
             train_loss += loss.item()
 
-        # validate
+        # ───── VALIDATION ─────
+
         model.eval()
-        val_loss, preds, labels = 0.0, [], []
+
+        val_loss = 0.0
+
+        preds = []
+        labels = []
+
         with torch.no_grad():
+
             for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                out     = model(xb)
+
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                out = model(xb)
+
                 val_loss += criterion(out, yb).item()
-                preds.extend(out.argmax(1).cpu().tolist())
-                labels.extend(yb.cpu().tolist())
 
-        avg_val  = val_loss / len(val_loader)
-        avg_tr   = train_loss / len(train_loader)
-        macro_f1 = f1_score(labels, preds, average="macro", zero_division=0)
+                preds.extend(
+                    out.argmax(1).cpu().tolist()
+                )
 
-        print(f"  Epoch {epoch:03d} | "
-              f"train={avg_tr:.4f}  val={avg_val:.4f}  "
-              f"val_macro_f1={macro_f1:.4f}")
+                labels.extend(
+                    yb.cpu().tolist()
+                )
+
+        avg_train = train_loss / len(train_loader)
+        avg_val = val_loss / len(val_loader)
+
+        macro_f1 = f1_score(
+            labels,
+            preds,
+            average="macro",
+            zero_division=0
+        )
+
+        print(
+            f"Epoch {epoch:03d} | "
+            f"train={avg_train:.4f} | "
+            f"val={avg_val:.4f} | "
+            f"val_macro_f1={macro_f1:.4f}"
+        )
+
+        # save best model
 
         if avg_val < best_val_loss:
-            best_val_loss  = avg_val
+
+            best_val_loss = avg_val
             patience_count = 0
-            torch.save(model.state_dict(), save_path)
-            print(f"    ✓ checkpoint saved")
+
+            torch.save(
+                model.state_dict(),
+                save_path
+            )
+
+            print("  ✓ checkpoint saved")
+
         else:
+
             patience_count += 1
+
             if patience_count >= patience:
-                print(f"  ⏹  Early stopping at epoch {epoch}")
+
+                print(
+                    f"  ⏹ Early stopping at epoch {epoch}"
+                )
+
                 break
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6.  Evaluation
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 5. Evaluation
+# ─────────────────────────────────────────────────────────────
 
-def run_evaluation(model, loader, device):
+def run_evaluation(model,
+                   loader,
+                   device):
+
     model.eval()
-    preds, labels = [], []
+
+    preds = []
+    labels = []
+
     with torch.no_grad():
+
         for xb, yb in loader:
-            out = model(xb.to(device))
-            preds.extend(out.argmax(1).cpu().tolist())
-            labels.extend(yb.tolist())
 
-    print("\n── Binary Identification Results ───────────────────────────────")
-    print(classification_report(
-        labels, preds,
-        target_names=["non_debt", "SATD"],
-        digits=3, zero_division=0,
-    ))
-    macro = f1_score(labels, preds, average="macro", zero_division=0)
-    print(f"  Macro-avg F1 = {macro:.3f}")
-    return preds, labels
+            xb = xb.to(device)
+
+            out = model(xb)
+
+            preds.extend(
+                out.argmax(1).cpu().tolist()
+            )
+
+            labels.extend(
+                yb.tolist()
+            )
+
+    print("\n── Binary Identification Results ─────────────")
+
+    print(
+        classification_report(
+            labels,
+            preds,
+            target_names=["non_debt", "SATD"],
+            digits=3,
+            zero_division=0
+        )
+    )
+
+    macro = f1_score(
+        labels,
+        preds,
+        average="macro",
+        zero_division=0
+    )
+
+    print(f"Macro-avg F1 = {macro:.3f}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7.  Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 6. Main
+# ─────────────────────────────────────────────────────────────
 
 def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"\n{'='*60}")
-    print(f"  BiLSTM  |  Binary Identification  |  Device: {device}")
-    print(f"{'='*60}\n")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    print("=" * 60)
+    print(f"CodeBERT + BiLSTM | Device: {device}")
+    print("=" * 60)
+
+    # ─────────────────────────────────────────────────
+    # LOAD CSV
+    # ─────────────────────────────────────────────────
 
     def load(split):
-        path = os.path.join(args.processed_dir, f"binary_{split}.csv")
+
+        path = os.path.join(
+            args.processed_dir,
+            f"binary_{split}.csv"
+        )
+
         if not os.path.exists(path):
+
             raise FileNotFoundError(
-                f"Missing: {path}\nRun 01_preprocessing.py first."
+                f"Missing: {path}"
             )
+
         return pd.read_csv(path)
 
     train_df = load("train")
-    val_df   = load("val")
-    test_df  = load("test")
+    val_df = load("val")
+    test_df = load("test")
 
-    print(f"  Rows → train:{len(train_df):,}  val:{len(val_df):,}  test:{len(test_df):,}")
-    print(f"\n  Label distribution (train):")
-    print("  ", train_df["binary_label"]
-                 .map({0: "non_debt", 1: "SATD"})
-                 .value_counts().to_string())
-
-    # Vocabulary
-    print("\n[1] Building vocabulary from training set...")
-    vocab = Vocabulary()
-    vocab.build(train_df["text_clean"].tolist())
-
-    # GloVe
-    print(f"\n[2] Loading GloVe  (dim={args.embed_dim})...")
-    embed_matrix = load_glove(args.glove_path, vocab, args.embed_dim)
-
-    # Loaders
-    print("\n[3] Building data loaders...")
-    def make_loader(df, shuffle=False):
-        ds = BinaryDataset(df, vocab, args.max_len)
-        return DataLoader(ds, batch_size=args.batch_size,
-                          shuffle=shuffle, num_workers=0)
-
-    train_loader = make_loader(train_df, shuffle=True)
-    val_loader   = make_loader(val_df)
-    test_loader  = make_loader(test_df)
-
-    # Model
-    print("\n[4] Initialising BiLSTM model...")
-    model = BiLSTMClassifier(
-        vocab_size=len(vocab),
-        embed_dim=args.embed_dim,
-        embed_matrix=embed_matrix,
-        num_classes=2,
-        dropout=0.3,
-    ).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Trainable parameters : {n_params:,}")
-
-    # Train
-    save_path = os.path.join(args.processed_dir, "bilstm_best.pt")
-    print(f"\n[5] Training  (max_epochs={args.max_epochs}, patience={args.patience})...")
-    run_training(
-        model, train_loader, val_loader, device,
-        lr=args.lr, max_epochs=args.max_epochs,
-        patience=args.patience, save_path=save_path,
+    print(
+        f"\nRows:"
+        f"\n  train = {len(train_df):,}"
+        f"\n  val   = {len(val_df):,}"
+        f"\n  test  = {len(test_df):,}"
     )
 
-    # Evaluate
-    print(f"\n[6] Loading best checkpoint and evaluating on test set...")
-    model.load_state_dict(torch.load(save_path, map_location=device))
-    run_evaluation(model, test_loader, device)
+    # ─────────────────────────────────────────────────
+    # CODEBERT EMBEDDINGS
+    # ─────────────────────────────────────────────────
+
+    print("\n[1] Loading CodeBERT...")
+
+    embedder = CodeBERTEmbedder(device)
+
+    print("\n[2] Generating embeddings...")
+
+    train_emb = embedder.embed_batch(
+        train_df["text_clean"].astype(str).tolist(),
+        batch_size=args.embed_batch_size
+    )
+
+    val_emb = embedder.embed_batch(
+        val_df["text_clean"].astype(str).tolist(),
+        batch_size=args.embed_batch_size
+    )
+
+    test_emb = embedder.embed_batch(
+        test_df["text_clean"].astype(str).tolist(),
+        batch_size=args.embed_batch_size
+    )
+
+    print(f"  Train embeddings : {tuple(train_emb.shape)}")
+    print(f"  Val embeddings   : {tuple(val_emb.shape)}")
+    print(f"  Test embeddings  : {tuple(test_emb.shape)}")
+
+    # ─────────────────────────────────────────────────
+    # DATASETS
+    # ─────────────────────────────────────────────────
+
+    print("\n[3] Building dataloaders...")
+
+    train_ds = EmbeddingDataset(
+        train_emb,
+        train_df["binary_label"].tolist()
+    )
+
+    val_ds = EmbeddingDataset(
+        val_emb,
+        val_df["binary_label"].tolist()
+    )
+
+    test_ds = EmbeddingDataset(
+        test_emb,
+        test_df["binary_label"].tolist()
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size
+    )
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=args.batch_size
+    )
+
+    # ─────────────────────────────────────────────────
+    # MODEL
+    # ─────────────────────────────────────────────────
+
+    print("\n[4] Initializing model...")
+
+    model = BiLSTMClassifier().to(device)
+
+    n_params = sum(
+        p.numel()
+        for p in model.parameters()
+        if p.requires_grad
+    )
+
+    print(f"Trainable parameters : {n_params:,}")
+
+    # ─────────────────────────────────────────────────
+    # TRAIN
+    # ─────────────────────────────────────────────────
+
+    save_path = os.path.join(
+        args.processed_dir,
+        "bilstm_best.pt"
+    )
+
+    print("\n[5] Training...")
+
+    run_training(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        lr=args.lr,
+        max_epochs=args.max_epochs,
+        patience=args.patience,
+        save_path=save_path
+    )
+
+    # ─────────────────────────────────────────────────
+    # TEST
+    # ─────────────────────────────────────────────────
+
+    print("\n[6] Evaluating best model...")
+
+    model.load_state_dict(
+        torch.load(
+            save_path,
+            map_location=device
+        )
+    )
+
+    run_evaluation(
+        model,
+        test_loader,
+        device
+    )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 7. CLI
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(
-        description="BiLSTM Binary Identification — Script 2/3"
+        description="CodeBERT + BiLSTM SATD Identification"
     )
+
     parser.add_argument(
-        "--processed_dir", default="./processed",
-        help="Folder with binary_train/val/test.csv from Script 1"
+        "--processed_dir",
+        default="./processed"
     )
+
     parser.add_argument(
-        "--glove_path", default="",
-        help="GloVe .txt file (recommended: glove.6B.300d.txt). "
-             "Leave blank for random init."
+        "--batch_size",
+        type=int,
+        default=32
     )
+
     parser.add_argument(
-        "--embed_dim", type=int, default=300,
-        help="Must match GloVe file: 50 | 100 | 200 | 300  (default: 300)"
+        "--embed_batch_size",
+        type=int,
+        default=64
     )
-    parser.add_argument("--max_len",    type=int,   default=128)
-    parser.add_argument("--batch_size", type=int,   default=32)
-    parser.add_argument("--lr",         type=float, default=1e-3)
-    parser.add_argument("--max_epochs", type=int,   default=50)
-    parser.add_argument("--patience",   type=int,   default=5)
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3
+    )
+
+    parser.add_argument(
+        "--max_epochs",
+        type=int,
+        default=50
+    )
+
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=5
+    )
+
+    parser.add_argument(
+        "--log_name",
+        type=str,
+        default="codebert_training_log"
+    )
+
     args = parser.parse_args()
-    main(args)
+
+    os.makedirs(args.processed_dir, exist_ok=True)
+
+    log_path = os.path.join(
+        args.processed_dir,
+        f"{args.log_name}.txt"
+    )
+
+    with open(log_path, "w", encoding="utf-8") as log_file:
+
+        with redirect_stdout(log_file):
+
+            print("=" * 70)
+            print("CodeBERT + BiLSTM SATD Training Log")
+            print("=" * 70)
+
+            print("\nSelected Arguments:")
+            print(f"processed_dir   : {args.processed_dir}")
+            print(f"batch_size      : {args.batch_size}")
+            print(f"embed_batch_size: {args.embed_batch_size}")
+            print(f"lr              : {args.lr}")
+            print(f"max_epochs      : {args.max_epochs}")
+            print(f"patience        : {args.patience}")
+            print(f"log_name        : {args.log_name}")
+
+            print("\n")
+
+            main(args)
+
+    print(f"\n✓ Training log saved to: {log_path}")
