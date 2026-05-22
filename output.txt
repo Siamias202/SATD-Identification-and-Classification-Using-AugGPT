@@ -1,0 +1,103 @@
+============================================================
+  BiLSTM  |  Binary Identification  |  Device: cuda
+============================================================
+
+  Rows → train:64,424  val:8,053  test:8,053
+
+  Label distribution (train):
+   binary_label
+non_debt    49756
+SATD        14668
+
+[1] Building vocabulary from training set...
+  Vocabulary size : 33,079
+
+[2] Loading GloVe  (dim=300)...
+  GloVe : 12,869 / 33,079 words matched  (dim=300)
+
+[3] Building data loaders...
+
+[4] Initialising BiLSTM model...
+  Trainable parameters : 11,189,366
+
+[5] Training  (max_epochs=50, patience=5)...
+  Epoch 001 | train=0.5403  val=0.5387  val_macro_f1=0.4357
+    ✓ checkpoint saved
+  Epoch 002 | train=0.5358  val=0.5367  val_macro_f1=0.4390
+    ✓ checkpoint saved
+  Epoch 003 | train=0.3548  val=0.2398  val_macro_f1=0.8877
+    ✓ checkpoint saved
+  Epoch 004 | train=0.2015  val=0.1708  val_macro_f1=0.9015
+    ✓ checkpoint saved
+  Epoch 005 | train=0.1380  val=0.1552  val_macro_f1=0.9146
+    ✓ checkpoint saved
+  Epoch 006 | train=0.1071  val=0.1722  val_macro_f1=0.9134
+  Epoch 007 | train=0.0817  val=0.1672  val_macro_f1=0.9195
+  Epoch 008 | train=0.0610  val=0.1885  val_macro_f1=0.9155
+  Epoch 009 | train=0.0462  val=0.2294  val_macro_f1=0.9169
+  Epoch 010 | train=0.0331  val=0.2584  val_macro_f1=0.9106
+  ⏹  Early stopping at epoch 10
+
+[6] Loading best checkpoint and evaluating on test set...
+
+── Binary Identification Results ───────────────────────────────
+              precision    recall  f1-score   support
+
+    non_debt      0.953     0.974     0.963      6219
+        SATD      0.906     0.836     0.870      1834
+
+    accuracy                          0.943      8053
+   macro avg      0.929     0.905     0.917      8053
+weighted avg      0.942     0.943     0.942      8053
+
+  Macro-avg F1 = 0.917
+
+
+
+--------------- BERT base uncased-----------------------
+── Categorization Results ───────────────────────────────────
+                    precision    recall  f1-score   support
+
+         code_debt      0.653     0.796     0.718       206
+documentation_debt      0.934     0.980     0.956       492
+         test_debt      0.959     0.959     0.959       540
+  requirement_debt      0.979     0.977     0.978       483
+       design_debt      0.533     0.212     0.304       113
+
+          accuracy                          0.905      1834
+         macro avg      0.812     0.785     0.783      1834
+      weighted avg      0.897     0.905     0.896      1834
+
+  Macro-avg F1 = 0.783
+
+------------------ Roberta--------------------------------
+ precision    recall  f1-score   support
+
+         code_debt      0.625     0.883     0.732       206
+documentation_debt      0.967     0.941     0.954       492
+         test_debt      0.956     0.967     0.961       540
+  requirement_debt      0.987     0.971     0.979       483
+       design_debt      0.674     0.257     0.372       113
+
+          accuracy                          0.908      1834
+         macro avg      0.842     0.804     0.800      1834
+      weighted avg      0.913     0.908     0.902      1834
+
+  Macro-avg F1 = 0.800
+
+
+
+── CodeBert ───────────────────────────────────
+                    precision    recall  f1-score   support
+
+         code_debt      0.726     0.670     0.697       206
+documentation_debt      0.950     0.959     0.954       492
+         test_debt      0.967     0.967     0.967       540
+  requirement_debt      0.969     0.979     0.974       483
+       design_debt      0.555     0.584     0.569       113
+
+          accuracy                          0.911      1834
+         macro avg      0.833     0.832     0.832      1834
+      weighted avg      0.910     0.911     0.911      1834
+
+  Macro-avg F1 = 0.832
