@@ -78,7 +78,7 @@ LEMMATIZER = WordNetLemmatizer()
 # Preprocessing
 # ============================================================
 
-def preprocess(text: str) -> str:
+def preprocess_glove(text: str) -> str:
 
     if not isinstance(text, str):
         return ""
@@ -114,6 +114,22 @@ def preprocess(text: str) -> str:
     ]
 
     return " ".join(tokens)
+
+def preprocess_llm_embeddings(text: str) -> str:
+
+    if not isinstance(text, str):
+        return ""
+
+    text = text.lower()
+
+    # remove only URLs
+    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
+
+    # keep punctuation (IMPORTANT for code/LLMs)
+    # remove only excessive whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
 
 # ============================================================
 # Labels
@@ -194,7 +210,7 @@ def main(input_csv, out_dir):
 
     print("\nPreprocessing text...")
 
-    df["text_clean"] = df["text"].apply(preprocess)
+    df["text_clean"] = df["text"].apply(preprocess_glove)
 
     # ========================================================
     # Labels
